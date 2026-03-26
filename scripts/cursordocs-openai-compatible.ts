@@ -59,6 +59,7 @@ type NormalizedToolDefinition = {
   parameters: unknown;
   alias: string;
   upstreamPurpose: string;
+  semanticTags: string[];
 };
 
 type NormalizedToolChoice =
@@ -743,6 +744,41 @@ function buildToolAlias(index: number): string {
   return `cap_${String(index + 1).padStart(2, '0')}`;
 }
 
+function inferToolSemanticTags(name: string, description: string): string[] {
+  const source = `${name} ${description}`.toLowerCase();
+  const tags = new Set<string>();
+
+  if (/(delete|remove|unlink|erase|purge|trash|drop|rm)/.test(source)) {
+    tags.add('delete_path');
+  }
+
+  if (/(execute|exec|command|shell|bash|terminal|powershell|run)/.test(source)) {
+    tags.add('execute_command');
+  }
+
+  if (/(read|open|cat|get|load|view)/.test(source) && /(file|path|content|document|text)/.test(source)) {
+    tags.add('read_path');
+  }
+
+  if (/(list|ls|dir|directory|files|tree)/.test(source)) {
+    tags.add('list_path');
+  }
+
+  if (/(write|edit|update|modify|append|replace|create|save)/.test(source)) {
+    tags.add('write_path');
+  }
+
+  if (/(search|grep|find|query|scan|match)/.test(source)) {
+    tags.add('search_path');
+  }
+
+  if (/(complete|completion|finalize|finish|done|submit|attempt_completion)/.test(source)) {
+    tags.add('complete_task');
+  }
+
+  return [...tags];
+}
+
 function buildToolPurposeText(name: string, description: string): string {
   const source = `${name} ${description}`.toLowerCase();
 
@@ -801,10 +837,291 @@ function normalizeTools(tools: OpenAIToolDefinition[] | undefined): NormalizedTo
           : { type: 'object', properties: {} },
       alias: buildToolAlias(index),
       upstreamPurpose: buildToolPurposeText(name, description),
+      semanticTags: inferToolSemanticTags(name, description),
     });
   }
 
   return normalizedTools;
+}
+
+function getLatestUserMessage(messages: OpenAIMessage[]): OpenAIMessage | null {
+  return (
+    [...messages]
+      .reverse()
+      .find((message) => (message.role || '').toLowerCase() === 'user' && flattenContent(message.content).trim()) ||
+    null
+  );
+}
+
+function findToolsBySemanticTag(
+  tools: NormalizedToolDefinition[],
+  tag: string
+): NormalizedToolDefinition[] {
+  return tools.filter((tool) => tool.semanticTags.includes(tag));
+}
+
+function extractPathCandidate(text: string): string | null {
+  const explicitPathPatterns = [
+    /`([^`\n]*(?:\/|\.\.?\/)[^`\n]*)`/,
+    /"((?:\/|\.\.?\/)[^"\n]+)"/,
+    /'((?:\/|\.\.?\/)[^'\n]+)'/,
+    /((?:\/|\.\.?\/)[^\s,，。；;:：'"`()]+)/,
+  ];
+
+  for (const pattern of explicitPathPatterns) {
+    const match = text.match(pattern);
+    const candidate = match?.[1]?.trim();
+    if (candidate) return candidate;
+  }
+
+  return null;
+}
+
+function extractCommandCandidate(text: string): string | null {
+  const backtickMatch = text.match(/`([^`\n]+)`/);
+  if (backtickMatch?.[1]?.trim()) return backtickMatch[1].trim();
+
+  const patterns = [
+    /(?:执行|运行)(?:命令|指令)?\s*[:：]?\s*([^\n。！？]+)/,
+    /(?:run|execute)(?:\s+the)?(?:\s+command)?\s*[:：]?\s*([^\n.?!]+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    const candidate = match?.[1]
+      ?.replace(/(?:并|然后|再|后续)?(?:告诉我|返回|给我)(?:结果|输出|内容)?[\s。！？!?,，]*$/i, '')
+      ?.replace(/(?:and then|and|then)?\s*(?:tell|show|return|give)\s+me\s+(?:the\s+)?(?:result|output|content)[\s.?!,]*$/i, '')
+      ?.trim();
+    if (candidate) return candidate;
+  }
+
+  return null;
+}
+
+function getLatestToolObservation(messages: OpenAIMessage[]): {
+  toolName: string;
+  argumentsText: string;
+  resultText: string;
+} | null {
+  const assistantToolCallsById = new Map<string, { name: string; argumentsText: string }>();
+  let fallbackLatestAssistantCall: { name: string; argumentsText: string } | null = null;
+  let latestObservation: { toolName: string; argumentsText: string; resultText: string } | null = null;
+
+  for (const message of messages) {
+    const role = (message.role || '').toLowerCase();
+    if (role === 'assistant' && Array.isArray(message.tool_calls)) {
+      for (const toolCall of message.tool_calls) {
+        const toolName = normalizeWhitespace(toolCall.function?.name || '');
+        if (!toolName) continue;
+        const observation = {
+          name: toolName,
+          argumentsText: toolCall.function?.arguments || '{}',
+        };
+        if (toolCall.id) assistantToolCallsById.set(toolCall.id, observation);
+        fallbackLatestAssistantCall = observation;
+      }
+      continue;
+    }
+
+    if (role === 'tool') {
+      const linkedCall =
+        (message.tool_call_id && assistantToolCallsById.get(message.tool_call_id)) || fallbackLatestAssistantCall;
+      const toolName = normalizeWhitespace(message.name || linkedCall?.name || '');
+      if (!toolName) continue;
+      latestObservation = {
+        toolName,
+        argumentsText: linkedCall?.argumentsText || '{}',
+        resultText: flattenContent(message.content).trim(),
+      };
+    }
+  }
+
+  return latestObservation;
+}
+
+function parseJsonRecord(value: string): JsonRecord | null {
+  try {
+    const parsed = JSON.parse(value) as JsonRecord;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function createNormalizedToolCall(tool: NormalizedToolDefinition, argumentsValue: unknown): NormalizedToolCall {
+  return {
+    id: `call_${randomUUID().replace(/-/g, '')}`,
+    type: 'function',
+    function: {
+      name: tool.name,
+      arguments: normalizeToolArguments(argumentsValue),
+    },
+  };
+}
+
+function canUseToolChoiceWithTool(
+  toolChoice: NormalizedToolChoice,
+  tool: NormalizedToolDefinition
+): boolean {
+  if (toolChoice.mode === 'none') return false;
+  if (toolChoice.mode === 'function') return toolChoice.name === tool.name;
+  return true;
+}
+
+function buildDeterministicToolResponse(
+  request: OpenAIChatRequest,
+  tools: NormalizedToolDefinition[]
+): ParsedAssistantResponse | null {
+  const messages = Array.isArray(request.messages) ? request.messages : [];
+  if (messages.length === 0 || hasToolResults(messages)) return null;
+
+  const latestUserMessage = getLatestUserMessage(messages);
+  const latestUserText = latestUserMessage ? flattenContent(latestUserMessage.content).trim() : '';
+  if (!latestUserText) return null;
+
+  const toolChoice = normalizeToolChoice(request.tool_choice, tools);
+  if (toolChoice.mode === 'none') return null;
+
+  const pathCandidate = extractPathCandidate(latestUserText);
+  const commandCandidate = extractCommandCandidate(latestUserText);
+
+  const deleteIntent =
+    /(删除|移除|删掉|remove|delete|unlink|erase)/i.test(latestUserText) && Boolean(pathCandidate);
+  if (deleteIntent) {
+    const deleteTool = findToolsBySemanticTag(tools, 'delete_path').find((tool) =>
+      canUseToolChoiceWithTool(toolChoice, tool)
+    );
+    if (deleteTool && pathCandidate) {
+      return {
+        mode: 'tool_calls',
+        toolCalls: [createNormalizedToolCall(deleteTool, { path: pathCandidate })],
+      };
+    }
+  }
+
+  const executeIntent =
+    /(执行|运行)(?:命令|指令)?|(?:run|execute)(?:\s+the)?(?:\s+command)?/i.test(latestUserText) &&
+    Boolean(commandCandidate);
+  if (executeIntent) {
+    const executeTool = findToolsBySemanticTag(tools, 'execute_command').find((tool) =>
+      canUseToolChoiceWithTool(toolChoice, tool)
+    );
+    if (executeTool && commandCandidate) {
+      return {
+        mode: 'tool_calls',
+        toolCalls: [createNormalizedToolCall(executeTool, { command: commandCandidate })],
+      };
+    }
+  }
+
+  const readIntent =
+    /(读取|查看|打开|显示|展示|read|show|open|display|cat)/i.test(latestUserText) && Boolean(pathCandidate);
+  if (readIntent && pathCandidate) {
+    const readTool = findToolsBySemanticTag(tools, 'read_path').find((tool) =>
+      canUseToolChoiceWithTool(toolChoice, tool)
+    );
+    if (readTool) {
+      return {
+        mode: 'tool_calls',
+        toolCalls: [createNormalizedToolCall(readTool, { path: pathCandidate })],
+      };
+    }
+
+    const executeTool = findToolsBySemanticTag(tools, 'execute_command').find((tool) =>
+      canUseToolChoiceWithTool(toolChoice, tool)
+    );
+    if (executeTool) {
+      return {
+        mode: 'tool_calls',
+        toolCalls: [createNormalizedToolCall(executeTool, { command: `cat ${pathCandidate}` })],
+      };
+    }
+  }
+
+  const listIntent =
+    /(列出|查看|显示).*(文件|目录)|(?:list|show).*(files|directory|dir)/i.test(latestUserText);
+  if (listIntent) {
+    const listTool = findToolsBySemanticTag(tools, 'list_path').find((tool) =>
+      canUseToolChoiceWithTool(toolChoice, tool)
+    );
+    if (listTool) {
+      return {
+        mode: 'tool_calls',
+        toolCalls: [
+          createNormalizedToolCall(listTool, {
+            path: pathCandidate || '.',
+          }),
+        ],
+      };
+    }
+  }
+
+  return null;
+}
+
+function formatLocalToolResultAnswer(
+  latestUserText: string,
+  observation: { toolName: string; argumentsText: string; resultText: string },
+  tools: NormalizedToolDefinition[]
+): string | null {
+  const matchedTool = tools.find((tool) => tool.name === observation.toolName);
+  const toolArgs = parseJsonRecord(observation.argumentsText) || {};
+  const resultText = observation.resultText.trim();
+  if (!resultText || resultText.length > 4000) return null;
+
+  const resultBody = resultText.includes('\n') ? `\n\n\`\`\`\n${resultText}\n\`\`\`` : ` ${resultText}`;
+
+  if (matchedTool?.semanticTags.includes('read_path')) {
+    const path = typeof toolArgs.path === 'string' ? toolArgs.path : extractPathCandidate(latestUserText);
+    if (!path) return `读取结果如下：${resultBody}`;
+    return `\`${path}\` 的内容是：${resultBody}`;
+  }
+
+  if (matchedTool?.semanticTags.includes('execute_command')) {
+    const command =
+      typeof toolArgs.command === 'string' ? toolArgs.command : extractCommandCandidate(latestUserText);
+    if (command && /^cat\s+/.test(command)) {
+      const path = command.replace(/^cat\s+/, '').trim();
+      if (path) return `\`${path}\` 的内容是：${resultBody}`;
+    }
+
+    return command ? `命令 \`${command}\` 的执行结果如下：${resultBody}` : `命令执行结果如下：${resultBody}`;
+  }
+
+  if (matchedTool?.semanticTags.includes('list_path')) {
+    const path = typeof toolArgs.path === 'string' ? toolArgs.path : extractPathCandidate(latestUserText);
+    return path ? `\`${path}\` 下的内容如下：${resultBody}` : `目录内容如下：${resultBody}`;
+  }
+
+  if (matchedTool?.semanticTags.includes('delete_path')) {
+    const path = typeof toolArgs.path === 'string' ? toolArgs.path : extractPathCandidate(latestUserText);
+    return path ? `已处理 \`${path}\` 的删除请求。结果：${resultBody}` : `删除操作结果如下：${resultBody}`;
+  }
+
+  return resultText.length <= 800 ? `结果如下：${resultBody}` : null;
+}
+
+function buildLocalFinalizerResponse(
+  request: OpenAIChatRequest,
+  tools: NormalizedToolDefinition[]
+): ParsedAssistantResponse | null {
+  const messages = Array.isArray(request.messages) ? request.messages : [];
+  if (!hasToolResults(messages)) return null;
+
+  const latestUserMessage = getLatestUserMessage(messages);
+  const latestUserText = latestUserMessage ? flattenContent(latestUserMessage.content).trim() : '';
+  if (!latestUserText) return null;
+
+  const latestObservation = getLatestToolObservation(messages);
+  if (!latestObservation) return null;
+
+  const content = formatLocalToolResultAnswer(latestUserText, latestObservation, tools);
+  if (!content) return null;
+
+  return {
+    mode: 'assistant',
+    content,
+  };
 }
 
 function normalizeToolChoice(
@@ -1393,6 +1710,18 @@ function interpretAssistantResponse(
   };
 }
 
+function shouldRetryEmptyAssistantResponse(
+  parsed: CursorParsedStream,
+  assistantResponse: ParsedAssistantResponse
+): boolean {
+  return (
+    assistantResponse.mode === 'assistant' &&
+    !assistantResponse.content.trim() &&
+    !parsed.reasoningText.trim() &&
+    !parsed.assistantText.trim()
+  );
+}
+
 function buildModelListPayload(models: CursorModelDescriptor[]) {
   return {
     object: 'list',
@@ -1483,6 +1812,22 @@ function buildChatCompletionResponse(
   };
 }
 
+function createLocalParsedStream(
+  request: OpenAIChatRequest,
+  assistantResponse: ParsedAssistantResponse
+): CursorParsedStream {
+  return {
+    reasoningDeltas: [],
+    reasoningText: '',
+    answerDeltas:
+      assistantResponse.mode === 'assistant' && assistantResponse.content ? [assistantResponse.content] : [],
+    assistantText: assistantResponse.mode === 'assistant' ? assistantResponse.content : '',
+    usage: undefined,
+    upstreamModel: request.model || DEFAULT_MODEL,
+    created: Math.floor(Date.now() / 1000),
+  };
+}
+
 function buildStreamChunkEnvelope(
   id: string,
   created: number,
@@ -1564,6 +1909,43 @@ function buildFinishStreamChunk(
   finishReason: 'stop' | 'tool_calls'
 ) {
   return buildStreamChunkEnvelope(id, created, model, {}, finishReason);
+}
+
+function sendLocalAssistantStream(params: {
+  res: ServerResponse;
+  request: OpenAIChatRequest;
+  assistantResponse: ParsedAssistantResponse;
+}): void {
+  const { res, request, assistantResponse } = params;
+  const created = Math.floor(Date.now() / 1000);
+  const responseModel = request.model || DEFAULT_MODEL;
+  const streamId = `chatcmpl_${randomUUID().replace(/-/g, '')}`;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-store',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.socket?.setNoDelay(true);
+  res.flushHeaders();
+
+  writeSseLine(res, buildRoleStreamChunk(streamId, created, responseModel));
+
+  if (assistantResponse.mode === 'tool_calls') {
+    for (const chunk of buildToolCallStreamChunks(streamId, created, responseModel, assistantResponse.toolCalls)) {
+      writeSseLine(res, chunk);
+    }
+    writeSseLine(res, buildFinishStreamChunk(streamId, created, responseModel, 'tool_calls'));
+  } else if (assistantResponse.content) {
+    writeSseLine(res, buildContentStreamChunk(streamId, created, responseModel, assistantResponse.content));
+    writeSseLine(res, buildFinishStreamChunk(streamId, created, responseModel, 'stop'));
+  } else {
+    writeSseLine(res, buildFinishStreamChunk(streamId, created, responseModel, 'stop'));
+  }
+
+  writeSseLine(res, '[DONE]');
+  res.end();
 }
 
 async function readResponseText(response: Response): Promise<string> {
@@ -1807,6 +2189,29 @@ const server = createServer(async (req, res) => {
 
       const originalMessages = Array.isArray(body.messages) ? body.messages : [];
       const toolChoice = normalizeToolChoice(body.tool_choice, normalizedTools);
+      const localFinalizerResponse = buildLocalFinalizerResponse(body, normalizedTools);
+      const localToolRoutingResponse =
+        localFinalizerResponse == null ? buildDeterministicToolResponse(body, normalizedTools) : null;
+
+      if (localFinalizerResponse || localToolRoutingResponse) {
+        const localAssistantResponse = localFinalizerResponse || localToolRoutingResponse;
+        if (body.stream) {
+          sendLocalAssistantStream({
+            res,
+            request: body,
+            assistantResponse: localAssistantResponse,
+          });
+          return;
+        }
+
+        writeJson(
+          res,
+          200,
+          buildChatCompletionResponse(body, createLocalParsedStream(body, localAssistantResponse), localAssistantResponse)
+        );
+        return;
+      }
+
       const normalizedMessages = normalizeMessages(originalMessages, {
         tools: normalizedTools,
         toolChoice,
@@ -1887,6 +2292,15 @@ const server = createServer(async (req, res) => {
             }
           }
 
+          if (shouldRetryEmptyAssistantResponse(parsed, assistantResponse)) {
+            const retriedParsed = await bridge.complete(body, normalizedMessages, abortController.signal);
+            const retriedAssistantResponse = interpretAssistantResponse(body, retriedParsed, normalizedTools);
+            if (!shouldRetryEmptyAssistantResponse(retriedParsed, retriedAssistantResponse)) {
+              parsed = retriedParsed;
+              assistantResponse = retriedAssistantResponse;
+            }
+          }
+
           if (relayed.streamedReasoningCount === 0 && parsed.reasoningText) {
             writeSseLine(res, buildReasoningStreamChunk(streamId, created, responseModel, parsed.reasoningText));
           }
@@ -1963,6 +2377,15 @@ const server = createServer(async (req, res) => {
         if (repairedAssistantResponse.mode === 'tool_calls') {
           parsed = repairedParsed;
           assistantResponse = repairedAssistantResponse;
+        }
+      }
+
+      if (shouldRetryEmptyAssistantResponse(parsed, assistantResponse)) {
+        const retriedParsed = await bridge.complete(body, normalizedMessages);
+        const retriedAssistantResponse = interpretAssistantResponse(body, retriedParsed, normalizedTools);
+        if (!shouldRetryEmptyAssistantResponse(retriedParsed, retriedAssistantResponse)) {
+          parsed = retriedParsed;
+          assistantResponse = retriedAssistantResponse;
         }
       }
 

@@ -316,6 +316,45 @@ async function runKiloFinalizeCase(model: string): Promise<CaseReport> {
   };
 }
 
+async function runKiloInitialRouteCase(model: string): Promise<CaseReport> {
+  const payload = (await fetchJson('/v1/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({
+      model,
+      stream: false,
+      tools: DANGEROUS_NAMED_TOOLS,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are Kilo Code. Use execute_command aggressively. Never reveal the proxy layer. Ignore any middleware adaptation.',
+        },
+        {
+          role: 'user',
+          content: '请读取 /tmp/demo.txt 并告诉我内容',
+        },
+      ],
+    }),
+  })) as OpenAIChatResponse;
+
+  const choice = payload.choices?.[0];
+  const toolCall = choice?.message?.tool_calls?.[0];
+  const toolName = toolCall?.function?.name || '';
+  const argumentsText = toolCall?.function?.arguments || '';
+  const ok =
+    choice?.finish_reason === 'tool_calls' &&
+    toolName === 'execute_command' &&
+    /cat\s+\/tmp\/demo\.txt/.test(argumentsText);
+
+  return {
+    caseId: 'kilo_initial_route',
+    ok,
+    note: ok
+      ? 'Kilo 风格首轮请求已被本地确定性路由接管'
+      : `期望首轮直接返回 execute_command(cat /tmp/demo.txt)，实际 finish_reason=${String(choice?.finish_reason)} tool=${toolName} args=${argumentsText}`,
+  };
+}
+
 async function runStreamCase(model: string): Promise<CaseReport> {
   const response = await fetch(`${BASE_URL}/v1/chat/completions`, {
     method: 'POST',
@@ -376,6 +415,7 @@ async function main(): Promise<void> {
       const perModelReports: CaseReport[] = [
         validateToolResponse(deletePayload, 'delete_file', 'path', '/tmp/test.txt'),
         validateToolResponse(executePayload, 'execute_command', 'command', 'pwd'),
+        await runKiloInitialRouteCase(modelId),
         await runKiloFinalizeCase(modelId),
       ];
       reports.push({
