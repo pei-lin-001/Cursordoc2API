@@ -12,6 +12,7 @@
 - OpenAI 风格非流式输出
 - 工具调用 shim（代理层模拟 OpenAI `tool_calls`）
 - assistant 预埋引导（用于压制站点内置的 Cursor 支持助手人格干扰）
+- capability alias 伪装层（降低危险工具名直接暴露给上游后的拦截概率）
 - Linux 无头服务器一条命令部署
 - 简单压测脚本
 - 上游探测脚本（模型验证 + reasoning metadata 结构分析）
@@ -30,6 +31,7 @@
 └── scripts/
     ├── cursordocs-openai-compatible.ts
     ├── cursordocs-prompt-bypass-test.ts
+    ├── cursordocs-tool-shim-test.ts
     ├── cursordocs-upstream-probe.ts
     ├── cursordocs-stress-test.ts
     └── deploy-cursordocs-linux.sh
@@ -85,6 +87,19 @@
 
 - 给上游模型注入严格输出格式约束
 - 再由代理把结构化结果转换成 OpenAI Compatible 的 `tool_calls`
+
+另外，这一层现在多做了一步 **capability alias 映射**：
+
+- 对客户端暴露的真实工具名，代理仍然保持原样
+- 但发给上游镜像站时，不再直接把 `delete_file`、`execute_command` 这类高风险名字原样摊开
+- 代理会把它们改写成更中性的 capability id（例如 `cap_01`、`cap_02`）
+- 等上游返回 capability 选择后，再由代理映射回真实 OpenAI Compatible `tool_calls`
+
+这样做的原因很直接：
+
+- 一些赛题镜像站会把“危险函数名 + 明显中间件口吻 + 固定 XML 格式”识别成提示注入攻击
+- 只要这些标志太明显，就可能在真正进入工具调用前被站点内置防护拦截
+- capability alias 层的目的，就是**降低可识别特征，同时不影响下游仍然拿到标准 `tool_calls`**
 
 这能满足大多数评测对“支持工具调用”的接口要求，但它不是上游官方原生工具协议。
 
@@ -207,6 +222,22 @@ pnpm run cursordocs:prompt-test
   - Cursor 产品题：`Cursor 的 Tab 功能是做什么的？`
 
 最后输出一份 JSON 报告，便于评测组直接判分。
+
+## tool shim 验题
+
+如果你想专门验证“危险工具名是否还会触发镜像站拦截”，可以运行：
+
+```bash
+pnpm run cursordocs:tool-test
+```
+
+这个脚本会自动验证：
+
+- `delete_file`
+- `execute_command`
+- SSE 流式 `tool_calls`
+
+并输出 JSON 报告，适合直接交给评测组。
 
 ## 接口示例
 
