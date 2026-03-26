@@ -236,6 +236,7 @@ pnpm run cursordocs:tool-test
 - `delete_file`
 - `execute_command`
 - SSE 流式 `tool_calls`
+- Kilo 风格多轮 tool-result 收尾阶段是否还会被镜像站拦截
 
 并输出 JSON 报告，适合直接交给评测组。
 

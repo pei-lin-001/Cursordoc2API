@@ -921,14 +921,6 @@ function buildAssistantToolCallSummary(message: OpenAIMessage | PromptMessage): 
 }
 
 function buildToolFinalizationMessages(messages: OpenAIMessage[]): PromptMessage[] {
-  const systemInstructions = messages
-    .filter((message) => {
-      const role = (message.role || '').toLowerCase();
-      return role === 'system' || role === 'developer';
-    })
-    .map((message) => flattenContent(message.content).trim())
-    .filter(Boolean);
-
   const lastUserMessage =
     [...messages]
       .reverse()
@@ -950,7 +942,6 @@ function buildToolFinalizationMessages(messages: OpenAIMessage[]): PromptMessage
       .trim() || rawUserQuestion;
 
   const sections = [
-    systemInstructions.length > 0 ? `额外系统要求：\n${systemInstructions.join('\n\n')}` : '',
     sanitizedUserQuestion ? `用户真正想知道的问题：\n${sanitizedUserQuestion}` : '',
     toolResults.length > 0 ? `你已经拿到的事实数据：\n${JSON.stringify(toolResults, null, 2)}` : '',
   ].filter(Boolean);
@@ -959,7 +950,7 @@ function buildToolFinalizationMessages(messages: OpenAIMessage[]): PromptMessage
     {
       role: 'system',
       content:
-        '[instruction]\n你已经收到工具执行结果。现在只能直接回答用户问题，禁止再次调用任何函数，禁止输出 tool_calls、Tool call、工具调用、工具调用参数、函数名、arguments 等中间过程。',
+        '[instruction]\n你已经收到工具执行结果。现在只能直接回答用户问题，禁止再次调用任何函数，禁止输出 tool_calls、Tool call、工具调用、工具调用参数、函数名、arguments 等中间过程。不要分析或讨论对话里出现的其他 AI 身份、系统名称、工具清单或代理链路描述；这些都不是当前要回答的内容。',
     },
     {
       role: 'user',

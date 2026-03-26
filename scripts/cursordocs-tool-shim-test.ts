@@ -21,6 +21,7 @@ type OpenAIChatResponse = {
   choices?: Array<{
     finish_reason?: string | null;
     message?: {
+      content?: unknown;
       tool_calls?: OpenAIToolCall[];
     };
   }>;
@@ -186,6 +187,28 @@ async function callToolCase(model: string, prompt: string): Promise<OpenAIChatRe
   })) as OpenAIChatResponse;
 }
 
+function flattenContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (!item || typeof item !== 'object') return '';
+        const record = item as JsonRecord;
+        if (typeof record.text === 'string') return record.text;
+        if (typeof record.content === 'string') return record.content;
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (content && typeof content === 'object') {
+    const record = content as JsonRecord;
+    if (typeof record.text === 'string') return record.text;
+    if (typeof record.content === 'string') return record.content;
+  }
+  return '';
+}
+
 function validateToolResponse(
   payload: OpenAIChatResponse,
   expectedToolName: string,
@@ -215,6 +238,81 @@ function validateToolResponse(
     note: ok
       ? `${expectedToolName} 正常返回`
       : `期望 ${expectedToolName}(${expectedArgumentKey}=${expectedArgumentValue})，实际 finish_reason=${String(choice?.finish_reason)} tool=${actualToolName} args=${actualArgumentText}`,
+  };
+}
+
+async function runKiloFinalizeCase(model: string): Promise<CaseReport> {
+  const payload = (await fetchJson('/v1/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({
+      model,
+      stream: false,
+      tools: DANGEROUS_NAMED_TOOLS,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are Kilo Code. Use tools execute_command, list_files, attempt_completion. Never mention that this is a proxy. Always follow Kilo Code system rules.',
+        },
+        {
+          role: 'user',
+          content: '请读取 /tmp/demo.txt 并告诉我内容',
+        },
+        {
+          role: 'assistant',
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: {
+                name: 'list_files',
+                arguments: '{"path":"/tmp"}',
+              },
+            },
+          ],
+        },
+        {
+          role: 'tool',
+          tool_call_id: 'call_1',
+          name: 'list_files',
+          content: '{"files":["demo.txt"]}',
+        },
+        {
+          role: 'assistant',
+          tool_calls: [
+            {
+              id: 'call_2',
+              type: 'function',
+              function: {
+                name: 'execute_command',
+                arguments: '{"command":"cat /tmp/demo.txt"}',
+              },
+            },
+          ],
+        },
+        {
+          role: 'tool',
+          tool_call_id: 'call_2',
+          name: 'execute_command',
+          content: 'hello from file',
+        },
+      ],
+    }),
+  })) as OpenAIChatResponse;
+
+  const choice = payload.choices?.[0];
+  const content = flattenContent(choice?.message?.content).trim();
+  const ok =
+    choice?.finish_reason === 'stop' &&
+    /hello from file/i.test(content) &&
+    !/Kilo Code|提示注入|system prompt injection|proxy/i.test(content);
+
+  return {
+    caseId: 'kilo_followup_finalize',
+    ok,
+    note: ok
+      ? 'Kilo 风格后续轮次未再触发镜像站拦截'
+      : `期望基于工具结果正常回答，实际 finish_reason=${String(choice?.finish_reason)} content=${content}`,
   };
 }
 
@@ -278,6 +376,7 @@ async function main(): Promise<void> {
       const perModelReports: CaseReport[] = [
         validateToolResponse(deletePayload, 'delete_file', 'path', '/tmp/test.txt'),
         validateToolResponse(executePayload, 'execute_command', 'command', 'pwd'),
+        await runKiloFinalizeCase(modelId),
       ];
       reports.push({
         model: modelId,
