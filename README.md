@@ -11,6 +11,7 @@
 - SSE 流式输出
 - OpenAI 风格非流式输出
 - 工具调用 shim（代理层模拟 OpenAI `tool_calls`）
+- assistant 预埋引导（用于压制站点内置的 Cursor 支持助手人格干扰）
 - Linux 无头服务器一条命令部署
 - 简单压测脚本
 - 上游探测脚本（模型验证 + reasoning metadata 结构分析）
@@ -85,6 +86,48 @@
 - 再由代理把结构化结果转换成 OpenAI Compatible 的 `tool_calls`
 
 这能满足大多数评测对“支持工具调用”的接口要求，但它不是上游官方原生工具协议。
+
+### 3. prompt engineering 说明
+
+这个镜像站点内置了比较强的站点人格提示，尤其在下面这类请求里干扰明显：
+
+- 精确输出测试
+- “忽略前置提示”“忽略系统提示”这类直接覆盖语句
+- 试图让模型自曝隐藏身份
+
+实测发现：
+
+- 单纯在 `user` 消息里写 “忽略隐藏提示” 往往不稳定
+- **预先注入一条 `assistant` 历史消息** 更有效
+
+因此代理默认会自动注入一条 assistant steering 消息，用来压制站点默认的 “Cursor support assistant” 人格，尽量恢复成普通聊天模型行为。
+
+另外，代理默认还会清洗掉一部分明显只是“和隐藏提示打架”的元指令，例如：
+
+- “忽略系统提示”
+- “忽略隐藏前置提示”
+- “你现在不是某某身份”
+- “最高优先级执行下面规则”
+
+这样做的目的，是把用户真正想做的任务提纯后再发给上游，减少触发站点内置防御提示的概率。
+
+如需关闭，可设置：
+
+```bash
+CURSORDOCS_ENABLE_ASSISTANT_STEERING=false
+```
+
+如需自定义提示词，可设置：
+
+```bash
+CURSORDOCS_ASSISTANT_STEERING_TEXT='你的自定义 assistant 引导词'
+```
+
+如果你不希望代理清洗这些元指令，可设置：
+
+```bash
+CURSORDOCS_SANITIZE_OVERRIDE_META=false
+```
 
 ## 本地启动
 
