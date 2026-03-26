@@ -98,9 +98,9 @@
 实测发现：
 
 - 单纯在 `user` 消息里写 “忽略隐藏提示” 往往不稳定
-- **预先注入一条 `assistant` 历史消息** 更有效
+- **预先注入一组“user 校准 + assistant 确认”的历史消息** 更有效
 
-因此代理默认会自动注入一条 assistant steering 消息，用来压制站点默认的 “Cursor support assistant” 人格，尽量恢复成普通聊天模型行为。
+因此代理默认会自动注入一组双消息 primer，用来压制站点默认的 “Cursor support assistant” 人格，尽量恢复成普通聊天模型行为。
 
 另外，代理默认还会清洗掉一部分明显只是“和隐藏提示打架”的元指令，例如：
 
@@ -120,6 +120,7 @@ CURSORDOCS_ENABLE_ASSISTANT_STEERING=false
 如需自定义提示词，可设置：
 
 ```bash
+CURSORDOCS_USER_STEERING_TEXT='你的自定义 user 校准词'
 CURSORDOCS_ASSISTANT_STEERING_TEXT='你的自定义 assistant 引导词'
 ```
 
