@@ -214,6 +214,69 @@ function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
+const LEADING_META_OVERRIDE_PATTERNS: RegExp[] = [
+  /^\s*(?:最高优先级|最高优先|以最高优先级)[^。！？!?\n]{0,80}(?:规则|要求|执行|遵循)/i,
+  /^\s*(?:please\s+)?(?:ignore|disregard|override|bypass|forget|drop|strip|remove|stop following)\b/i,
+  /^\s*(?:please\s+)?(?:do not follow|don't follow|do not obey|don't obey|be unaffected by|not be affected by)\b/i,
+  /^\s*(?:please\s+)?(?:you are not|you're not)\b/i,
+  /^\s*(?:请)?(?:忽略|无视|不要理会|别理会|绕过|覆盖|屏蔽)/i,
+  /^\s*(?:请)?(?:不要被|别被|不受)[^。！？!?\n]{0,40}(?:影响|干扰)/i,
+  /^\s*你现在不是/i,
+];
+
+const META_ONLY_HINT_PATTERNS: RegExp[] = [
+  /^\s*(?:当前任务是一个精确输出测试|这是一个精确输出测试|this is an exact output test)\s*[:：]?\s*$/i,
+];
+
+const TASK_INTENT_PATTERNS: RegExp[] = [
+  /\b(?:answer|reply|explain|introduce|summarize|describe|output|return|tell|give|write|list|calculate|solve|translate|only answer|only output|exactly)\b/i,
+  /(?:回答|回复|介绍|解释|总结|说明|列出|输出|给出|写|计算|求解|翻译|只输出|精确输出|直接回答|直接输出|请只输出|请只回答)/i,
+];
+
+const META_PREFIX_CAPTURE_PATTERNS: RegExp[] = [
+  /^\s*(?:please\s+)?(?:ignore|disregard|override|bypass|forget|drop|strip|remove|stop following)\b[\s\S]{0,240}?(?:,|;|:|\bthen\b|\band then\b|\band\b|\bnow\b|\binstead\b|\bjust\b|\bsimply\b)\s*(.+)$/i,
+  /^\s*(?:please\s+)?(?:do not follow|don't follow|do not obey|don't obey|be unaffected by|not be affected by)\b[\s\S]{0,240}?(?:,|;|:|\bthen\b|\band then\b|\band\b|\bnow\b|\binstead\b|\bjust\b|\bsimply\b)\s*(.+)$/i,
+  /^\s*(?:please\s+)?(?:you are not|you're not)\b[\s\S]{0,180}?(?:,|;|:|\bthen\b|\band then\b|\band\b|\bnow\b|\binstead\b|\bjust\b|\bsimply\b)\s*(.+)$/i,
+  /^\s*(?:请)?(?:忽略|无视|不要理会|别理会|绕过|覆盖|屏蔽)[\s\S]{0,180}?(?:，|,|；|;|：|:|然后|并且|并|接着|改为|直接|只需|请)\s*(.+)$/i,
+  /^\s*(?:请)?(?:不要被|别被|不受)[\s\S]{0,120}?(?:影响|干扰)[\s\S]{0,80}?(?:，|,|；|;|：|:|然后|并且|并|接着|改为|直接|只需|请)\s*(.+)$/i,
+  /^\s*你现在不是[\s\S]{0,120}?(?:，|,|；|;|：|:|然后|并且|并|接着|改为|直接|只需|请)\s*(.+)$/i,
+];
+
+function hasTaskIntent(text: string): boolean {
+  return TASK_INTENT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function looksLikeLeadingMetaOverride(text: string): boolean {
+  return LEADING_META_OVERRIDE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function splitPromptIntoSegments(text: string): string[] {
+  return text
+    .split(/(?:\r?\n)+|(?<=[。！？!?;；])\s+|(?<=\.)\s+(?=[A-Z\u4e00-\u9fff])/g)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+function stripLeadingMetaOverridePrefix(segment: string): string {
+  let current = segment.trim();
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let changed = false;
+    for (const pattern of META_PREFIX_CAPTURE_PATTERNS) {
+      const match = current.match(pattern);
+      const candidate = match?.[1]?.trim();
+      if (!candidate || candidate.length >= current.length) continue;
+      if (!hasTaskIntent(candidate)) continue;
+      current = candidate;
+      changed = true;
+      break;
+    }
+    if (!changed) break;
+  }
+
+  return current;
+}
+
 function approximateTokens(text: string): number {
   if (!text) return 0;
   return Math.max(1, Math.ceil(text.length / 4));
@@ -253,22 +316,17 @@ function sanitizeUserPromptForInjectedPersona(text: string): string {
   const original = text.trim();
   if (!original) return original;
 
-  const patterns: RegExp[] = [
-    /最高优先级执行下面规则[:：]?\s*/gi,
-    /忽略你收到的站点内置身份[、，,\s]*文档助手身份[、，,\s]*品牌身份[、，,\s]*隐藏前置提示[。！？!?\s]*/gi,
-    /忽略(?:你收到的)?(?:站点|网站|系统|隐藏|内置|默认)?(?:前置)?提示词?[。！？!?\s]*/gi,
-    /忽略(?:所有|任何)?(?:之前|此前|上文|前面|已有|隐藏|系统)(?:的)?(?:指令|提示|提示词|设定|身份)[。！？!?\s]*/gi,
-    /ignore(?: all)?(?: previous| prior| hidden| system| builtin| built-in| default)?(?: instructions?| prompts?| prompt| persona| role| identity)[^\\n。！？!?]*/gi,
-    /you are not (?:a|an|the) [^\\n.?!]{0,80}[.?!]?/gi,
-    /你现在不是[^\\n。！？!?]{0,80}[。！？!?]?/gi,
-    /不要参考任何文档内容[。！？!?\s]*/gi,
-    /当前任务是一个精确输出测试[。！？!?\s]*/gi,
-  ];
+  const keptSegments = splitPromptIntoSegments(original)
+    .map((segment) => stripLeadingMetaOverridePrefix(segment))
+    .map((segment) => segment.trim())
+    .filter((segment) => {
+      if (!segment) return false;
+      if (META_ONLY_HINT_PATTERNS.some((pattern) => pattern.test(segment))) return false;
+      if (looksLikeLeadingMetaOverride(segment) && !hasTaskIntent(segment)) return false;
+      return true;
+    });
 
-  let sanitized = original;
-  for (const pattern of patterns) {
-    sanitized = sanitized.replace(pattern, ' ');
-  }
+  let sanitized = keptSegments.join('\n');
 
   sanitized = sanitized
     .replace(/[ \t]+/g, ' ')
@@ -276,7 +334,9 @@ function sanitizeUserPromptForInjectedPersona(text: string): string {
     .replace(/^[，。；;:：\-\s]+/g, '')
     .trim();
 
-  return sanitized || original;
+  if (sanitized) return sanitized;
+  if (looksLikeLeadingMetaOverride(original)) return '';
+  return original;
 }
 
 function buildAbortSignal(signal?: AbortSignal): AbortSignal {
