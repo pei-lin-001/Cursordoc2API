@@ -144,6 +144,7 @@ const API_KEY = process.env.CURSORDOCS_OPENAI_API_KEY?.trim() || '';
 const STARTUP_URL = process.env.CURSORDOCS_UPSTREAM_BASE_URL?.trim() || 'https://cursor.com';
 const DEFAULT_MODEL =
   process.env.CURSORDOCS_DEFAULT_MODEL?.trim() || 'anthropic/claude-sonnet-4.6';
+const MODELS_DISCOVERY_PATH = process.env.CURSORDOCS_MODELS_DISCOVERY_PATH?.trim() || '/cn/docs';
 const REQUEST_TIMEOUT_MS = parseInt(
   process.env.CURSORDOCS_REQUEST_TIMEOUT_MS?.trim() || '120000',
   10
@@ -151,6 +152,10 @@ const REQUEST_TIMEOUT_MS = parseInt(
 const MODELS_CACHE_TTL_MS = parseInt(
   process.env.CURSORDOCS_MODELS_CACHE_TTL_MS?.trim() || '300000',
   10
+);
+const FETCH_DYNAMIC_MODELS = parseBoolean(
+  process.env.CURSORDOCS_FETCH_DYNAMIC_MODELS,
+  true
 );
 const INCLUDE_DEFAULT_CONTEXT = parseBoolean(
   process.env.CURSORDOCS_INCLUDE_DEFAULT_CONTEXT,
@@ -302,6 +307,170 @@ function parseExposedModels(text: string): CursorModelDescriptor[] {
   }
 
   return models;
+}
+
+function collectModelDescriptorsFromText(
+  text: string,
+  source: string,
+  sourceUrl?: string
+): CursorModelDescriptor[] {
+  const models: CursorModelDescriptor[] = [];
+  const seen = new Set<string>();
+  const pattern =
+    /"([^"\n]{1,80})":"((?:openai|anthropic|google|xai|deepseek|mistral|meta|groq|perplexity|cohere|qwen|alibaba|moonshot|fireworks|together|bedrock|vertexai)\/[a-z0-9._:-]{1,160})"/g;
+
+  for (const match of text.matchAll(pattern)) {
+    const displayName = match[1]?.trim() || '';
+    const id = match[2]?.trim() || '';
+    if (!displayName || !id || seen.has(id)) continue;
+    if (!/[A-Za-z]/.test(displayName)) continue;
+    seen.add(id);
+
+    const provider = id.includes('/') ? id.split('/')[0] || 'cursor.com' : 'cursor.com';
+    models.push({
+      id,
+      displayName,
+      provider,
+      raw: {
+        source,
+        source_url: sourceUrl || null,
+        discovered: true,
+      },
+    });
+  }
+
+  return models;
+}
+
+function mergeModelDescriptors(groups: CursorModelDescriptor[][]): CursorModelDescriptor[] {
+  const merged: CursorModelDescriptor[] = [];
+  const seen = new Set<string>();
+
+  for (const group of groups) {
+    for (const model of group) {
+      if (!model.id || seen.has(model.id)) continue;
+      seen.add(model.id);
+      merged.push(model);
+    }
+  }
+
+  return merged;
+}
+
+function extractChunkUrlsFromHtml(html: string): string[] {
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const pattern = /(?:src|href)=["']([^"']*\/_next\/static\/chunks\/[^"']+\.js[^"']*)["']/g;
+
+  for (const match of html.matchAll(pattern)) {
+    const rawUrl = match[1]?.trim();
+    if (!rawUrl) continue;
+    const resolved = new URL(rawUrl, STARTUP_URL).toString();
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    urls.push(resolved);
+  }
+
+  return urls;
+}
+
+function extractNestedChunkUrlsFromText(text: string, baseUrl: string): string[] {
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const pattern = /"(static\/chunks\/[^"\s]+\.js)"/g;
+  const assetBaseUrl = new URL('/docs-static/_next/', STARTUP_URL).toString();
+
+  for (const match of text.matchAll(pattern)) {
+    const rawUrl = match[1]?.trim();
+    if (!rawUrl) continue;
+    const resolved = new URL(rawUrl, assetBaseUrl).toString();
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    urls.push(resolved);
+  }
+
+  return urls;
+}
+
+async function fetchText(url: string, signal?: AbortSignal): Promise<string> {
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'text/html,application/javascript,text/javascript,*/*;q=0.8',
+      'User-Agent': 'Mozilla/5.0',
+    },
+    signal: buildAbortSignal(signal),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} while fetching ${url}`);
+  }
+
+  return response.text();
+}
+
+async function discoverModelsFromUpstream(signal?: AbortSignal): Promise<CursorModelDescriptor[]> {
+  if (!FETCH_DYNAMIC_MODELS) return [];
+
+  const discoveryUrl = new URL(MODELS_DISCOVERY_PATH, STARTUP_URL).toString();
+  const html = await fetchText(discoveryUrl, signal);
+  const modelsFromHtml = collectModelDescriptorsFromText(html, 'cursor-docs-html-scan', discoveryUrl);
+  if (modelsFromHtml.length > 0) return modelsFromHtml;
+
+  const chunkUrls = extractChunkUrlsFromHtml(html);
+  if (chunkUrls.length === 0) return [];
+
+  const scripts = await Promise.all(
+    chunkUrls.map(async (chunkUrl) => {
+      try {
+        return {
+          chunkUrl,
+          text: await fetchText(chunkUrl, signal),
+        };
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  const validScripts = scripts.filter((item): item is { chunkUrl: string; text: string } => item != null);
+  const discoveredFromInitialScripts = mergeModelDescriptors(
+    validScripts
+      .map((item) => collectModelDescriptorsFromText(item.text, 'cursor-docs-chunk-scan', item.chunkUrl))
+      .filter((models) => models.length > 0)
+  );
+  if (discoveredFromInitialScripts.length > 0) return discoveredFromInitialScripts;
+
+  const nestedChunkUrls = Array.from(
+    new Set(
+      validScripts.flatMap((item) => extractNestedChunkUrlsFromText(item.text, item.chunkUrl))
+    )
+  ).filter((url) => !chunkUrls.includes(url));
+
+  if (nestedChunkUrls.length === 0) return [];
+
+  const nestedScripts = await Promise.all(
+    nestedChunkUrls.map(async (chunkUrl) => {
+      try {
+        return {
+          chunkUrl,
+          text: await fetchText(chunkUrl, signal),
+        };
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  const discovered = mergeModelDescriptors(
+    nestedScripts
+      .filter((item): item is { chunkUrl: string; text: string } => item != null)
+      .map((item) =>
+        collectModelDescriptorsFromText(item.text, 'cursor-docs-nested-chunk-scan', item.chunkUrl)
+      )
+      .filter((models) => models.length > 0)
+  );
+
+  return discovered;
 }
 
 function createEmptyParsedStream(): CursorParsedStream {
@@ -1303,14 +1472,30 @@ class CursorHttpBridge {
       return cached.models;
     }
 
-    const models = EXPOSED_MODELS.length > 0 ? EXPOSED_MODELS : [
-      {
-        id: DEFAULT_MODEL,
-        displayName: DEFAULT_MODEL,
-        provider: DEFAULT_MODEL.split('/')[0] || 'cursor.com',
-        raw: { source: 'fallback-default-model' },
-      },
-    ];
+    let models: CursorModelDescriptor[] = [];
+
+    try {
+      models = await discoverModelsFromUpstream();
+    } catch (error) {
+      console.warn(
+        '[cursordocs-openai-compatible] failed to discover live model list, falling back to configured models:',
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+
+    if (models.length === 0) {
+      models =
+        EXPOSED_MODELS.length > 0
+          ? EXPOSED_MODELS
+          : [
+              {
+                id: DEFAULT_MODEL,
+                displayName: DEFAULT_MODEL,
+                provider: DEFAULT_MODEL.split('/')[0] || 'cursor.com',
+                raw: { source: 'fallback-default-model' },
+              },
+            ];
+    }
 
     this.modelsCache = {
       fetchedAt: now,

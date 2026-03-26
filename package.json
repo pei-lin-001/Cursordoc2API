@@ -8,7 +8,8 @@
   "scripts": {
     "cursordocs:openai": "tsx scripts/cursordocs-openai-compatible.ts",
     "cursordocs:stress": "tsx scripts/cursordocs-stress-test.ts",
-    "typecheck": "tsc --noEmit scripts/cursordocs-openai-compatible.ts scripts/cursordocs-stress-test.ts --target ES2022 --module NodeNext --moduleResolution NodeNext --esModuleInterop --skipLibCheck"
+    "cursordocs:probe": "tsx scripts/cursordocs-upstream-probe.ts",
+    "typecheck": "tsc --noEmit scripts/cursordocs-openai-compatible.ts scripts/cursordocs-stress-test.ts scripts/cursordocs-upstream-probe.ts --target ES2022 --module NodeNext --moduleResolution NodeNext --esModuleInterop --skipLibCheck"
   },
   "engines": {
     "node": ">=20.0.0"

@@ -7,11 +7,13 @@
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
+- 动态模型拉取（优先扫描站点 chunk，失败再回落到预设映射）
 - SSE 流式输出
 - OpenAI 风格非流式输出
 - 工具调用 shim（代理层模拟 OpenAI `tool_calls`）
 - Linux 无头服务器一条命令部署
 - 简单压测脚本
+- 上游探测脚本（模型验证 + reasoning metadata 结构分析）
 
 ## 目录结构
 
@@ -26,6 +28,7 @@
 │       └── cursordocs-linux-one-command-deploy.md
 └── scripts/
     ├── cursordocs-openai-compatible.ts
+    ├── cursordocs-upstream-probe.ts
     ├── cursordocs-stress-test.ts
     └── deploy-cursordocs-linux.sh
 ```
@@ -43,9 +46,11 @@
 - 更适合 Linux 无头服务器
 - 性能和部署复杂度都更可控
 
-## 已确认的默认模型映射
+## 模型列表策略
 
-当前默认暴露 3 个已经逆向确认的模型：
+当前实现会优先从站点页面和 `_next/static/chunks/*.js` 里动态扫描模型映射。
+
+如果动态扫描失败，才会回落到下面这 3 个已经逆向确认的默认模型：
 
 - `anthropic/claude-sonnet-4.6`
 - `openai/gpt-5.1-codex-mini`
@@ -63,7 +68,14 @@
 
 - 支持普通内容流式输出
 - 保留 reasoning 事件解析逻辑
+- 能抓到 `reasoningEncryptedContent`
 - 但**不能承诺一定拿到明文 reasoning_content**
+
+补充一点：
+
+- 当前抓到的 `reasoningEncryptedContent` 前缀形态像 Fernet token（常见前缀 `gAAAAA...`）
+- 如果没有真正的密钥，就只能做**结构识别**，不能做可信的明文解密
+- 仓库里的 `cursordocs:probe` 支持在你提供 `CURSORDOCS_REASONING_FERNET_KEY` 时尝试解密
 
 ### 2. tool calling 说明
 
@@ -92,6 +104,27 @@ pnpm run cursordocs:openai
 
 ```bash
 http://127.0.0.1:8790
+```
+
+## 上游验题脚本
+
+如果你想直接验证：
+
+- 站点当前可发现哪些模型
+- 每个模型是否真的可用
+- OpenAI 模型是否返回 `reasoningEncryptedContent`
+- 这段 metadata 是否长得像 Fernet 密文
+
+可以运行：
+
+```bash
+pnpm run cursordocs:probe
+```
+
+如果你后来真的拿到了 Fernet key，还可以追加：
+
+```bash
+CURSORDOCS_REASONING_FERNET_KEY='你的 key' pnpm run cursordocs:probe
 ```
 
 ## 接口示例
