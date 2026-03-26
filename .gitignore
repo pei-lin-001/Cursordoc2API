@@ -1,0 +1,5 @@
+node_modules/
+.env
+.cursordocs-linux/
+*.log
+.DS_Store

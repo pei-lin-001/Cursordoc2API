@@ -1,0 +1,21 @@
+{
+  "name": "cursordoc2api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.28.2",
+  "description": "OpenAI Compatible HTTP bridge for the Cursor Docs mirror site",
+  "scripts": {
+    "cursordocs:openai": "tsx scripts/cursordocs-openai-compatible.ts",
+    "cursordocs:stress": "tsx scripts/cursordocs-stress-test.ts",
+    "typecheck": "tsc --noEmit scripts/cursordocs-openai-compatible.ts scripts/cursordocs-stress-test.ts --target ES2022 --module NodeNext --moduleResolution NodeNext --esModuleInterop --skipLibCheck"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
